@@ -21,7 +21,7 @@ used in the world's biggest online commerce company [Alibaba](http://www.alibaba
 0. Transparent key prefixing.
 0. Abstraction for Lua scripting, allowing you to define custom commands.
 0. Support for binary data.
-0. Support for both TCP/IP and UNIX domain sockets.
+0. Support for TLS.
 0. Support for offline queue and ready checking.
 0. Support for ES6 types, such as `Map` and `Set`.
 0. Support for GEO commands (Redis 3.2 Unstable).
@@ -62,6 +62,9 @@ redis.get('foo').then(function (result) {
 // Arguments to commands are flattened, so the following are the same:
 redis.sadd('set', 1, 3, 5, 7);
 redis.sadd('set', [1, 3, 5, 7]);
+
+// All arguments are passed directly to the redis server:
+redis.set('key', 100, 'EX', 10);
 ```
 
 ## Connect to Redis
@@ -73,7 +76,6 @@ You can specify which Redis to connect to by:
 new Redis()       // Connect to 127.0.0.1:6379
 new Redis(6380)   // 127.0.0.1:6380
 new Redis(6379, '192.168.1.1')        // 192.168.1.1:6379
-new Redis('redis://:authpassword@127.0.0.1:6380/4')   // 127.0.0.1:6380, db 4
 new Redis('/tmp/redis.sock')
 new Redis({
   port: 6379,          // Redis port
@@ -82,6 +84,13 @@ new Redis({
   password: 'auth',
   db: 0
 })
+```
+
+You can also specify connection options as a [`redis://` URL](http://www.iana.org/assignments/uri-schemes/prov/redis):
+
+```javascript
+// Connect to 127.0.0.1:6380, db 4, using password "authpassword":
+new Redis('redis://:authpassword@127.0.0.1:6380/4')
 ```
 
 See [API Documentation](API.md#new_Redis) for all available options.
@@ -234,7 +243,7 @@ redis.multi().set('foo', 'bar', function (err, result) {
 }).exec(/* ... */);
 ```
 
-If you want to use transaction without pipeline, pass { pipeline: false } to `multi`,
+If you want to use transaction without pipeline, pass `{ pipeline: false }` to `multi`,
 and every command will be sent to Redis immediately without waiting for an `exec` invocation:
 
 ```javascript
@@ -260,18 +269,6 @@ in the pipeline into a transaction:
 
 ```javascript
 redis.pipeline().get('foo').multi().set('foo', 'bar').get('foo').exec().get('foo').exec();
-```
-
-```javascript
-redis.mset({ k1: 'v1', k2: 'v2' });
-redis.get('k1', function (err, result) {
-  // result === 'v1';
-});
-
-redis.mset(new Map([['k3', 'v3'], ['k4', 'v4']]));
-redis.get('k3', function (err, result) {
-  // result === 'v3';
-});
 ```
 
 ## Lua Scripting
@@ -393,7 +390,19 @@ Redis.Command.setReplyTransformer('hgetall', function (result) {
 
 There are three built-in transformers, two argument transformers for `hmset` & `mset` and
 a reply transformer for `hgetall`. Transformers for `hmset` and `hgetall` were mentioned
-above, and the transformer for `mset` is similar to the one for `hmset`.
+above, and the transformer for `mset` is similar to the one for `hmset`:
+
+```javascript
+redis.mset({ k1: 'v1', k2: 'v2' });
+redis.get('k1', function (err, result) {
+  // result === 'v1';
+});
+
+redis.mset(new Map([['k3', 'v3'], ['k4', 'v4']]));
+redis.get('k3', function (err, result) {
+  // result === 'v3';
+});
+```
 
 ## Monitor
 Redis supports the MONITOR command,
@@ -490,6 +499,26 @@ This behavior can be disabled by setting the `autoResubscribe` option to `false`
 And if the previous connection has some unfulfilled commands (most likely blocking commands such as `brpop` and `blpop`),
 the client will resend them when reconnected. This behavior can be disabled by setting the `autoResendUnfulfilledCommands` option to `false`.
 
+### Reconnect on error
+
+Besides auto-reconnect when the connection is closed, ioredis supports reconnecting on the specified errors by the `reconnectOnError` option. Here's an example that will reconnect when receiving `READONLY` error:
+
+```javascript
+var redis = new Redis({
+  reconnectOnError: function (err) {
+    var targetError = 'READONLY';
+    if (err.message.slice(0, targetError.length) === targetError) {
+      // Only reconnect when the error starts with "READONLY"
+      return true; // or `return 1;`
+    }
+  }
+});
+```
+
+This feature is useful when using Amazon ElastiCache. Once failover happens, Amazon ElastiCache will switch the master we currently connected with to a slave, leading to the following writes fails with the error `READONLY`. Using `reconnectOnError`, we can force the connection to reconnect on this error in order to connect to the new master.
+
+Furthermore, if the `reconnectOnError` returns `2`, ioredis will resend the failed command after reconnecting.
+
 ## Connection Events
 The Redis instance will emit some events about the state of the connection to the Redis server.
 
@@ -501,6 +530,7 @@ error    | client will emit `error` when an error occurs while connecting.<br>Ho
 close    | client will emit `close` when an established Redis server connection has closed.
 reconnecting | client will emit `reconnecting` after `close` when a reconnection will be made. The argument of the event is the time (in ms) before reconnecting.
 end     | client will emit `end` after `close` when no more reconnections will be made.
+authError | client will emit `authError` when the password specified in the options is wrong or the server doesn't require a password.
 
 You can also check out the `Redis#status` property to get the current connection status.
 
@@ -511,6 +541,21 @@ option to `false`:
 
 ```javascript
 var redis = new Redis({ enableOfflineQueue: false });
+```
+
+## TLS Options
+Redis doesn't support TLS natively, however if the redis server you want to connect to is hosted behind a TLS proxy (e.g. [stunnel](https://www.stunnel.org/)) or is offered by a PaaS service that supports TLS connection (e.g. [Redis Labs](https://redislabs.com/)), you can set the `tls` option:
+
+```javascript
+var redis = new Redis({
+  host: 'localhost',
+  tls: {
+    // Refer to `tls.connect()` section in
+    // https://nodejs.org/api/tls.html
+    // for all supported options
+    ca: fs.readFileSync('cert.pem')
+  }
+});
 ```
 
 <hr>
@@ -679,7 +724,7 @@ Unhandled rejection ReplyError: ERR wrong number of arguments for 'set' command
     at TCP.onread (net.js:509:20)
 ```
 
-But the error stack doesn't make any sense because the whole stack happens in the ioreids
+But the error stack doesn't make any sense because the whole stack happens in the ioredis
 module itself, not in your code. So it's not easy to find out where the error happens in your code.
 ioredis provides an option `showFriendlyErrorStack` to solve the problem. When you enable
 `showFriendlyErrorStack`, ioredis will optimize the error stack for you:
@@ -723,7 +768,7 @@ redis.set('foo');
 
 # Benchmark
 
-Comparisons with [node_redis](https://github.com/mranney/node_redis) on my iMac (Retina 5K, 27-inch, Late 2014):
+Comparisons with [node_redis](https://github.com/mranney/node_redis) on my iMac (Retina 5K, 27-inch, Late 2014). Both of them are using pure JavaScript parser(without hiredis module):
 
 ```shell
 > npm run bench
@@ -815,29 +860,8 @@ I'm happy to receive bug reports, fixes, documentation enhancements, and any oth
 
 And since I'm not a native English speaker, if you find any grammar mistakes in the documentation, please also let me know. :)
 
-## Contributors
-Ordered by date of first contribution. [Auto-generated](https://github.com/dtrejo/node-authors) on Mon, 03 Aug 2015 12:14:05 GMT.
-
-- [luin](https://github.com/luin)
-- [Howard Yeh](https://github.com/hayeah) aka `hayeah`
-- [Luigi Pinca](https://github.com/lpinca) aka `lpinca`
-- [HanHor Wu](https://github.com/undefined) aka `undefined`
-- [Yaroslav Admin](https://github.com/devoto13) aka `devoto13`
-- [Vitaly Aminev](https://github.com/AVVS) aka `AVVS`
-- [alfred sang](https://github.com/ionicbook) aka `ionicbook`
-- [Joel Edwards](https://github.com/joeledwards) aka `joeledwards`
-- [Ari Aosved](https://github.com/devaos) aka `devaos`
-- [Nakul G](https://github.com/nakulgan) aka `nakulgan`
-- [Frank Murphy](https://github.com/FMurphyHernandez) aka `FMurphyHernandez`
-- [Vikram](https://github.com/VikramTiwari) aka `VikramTiwari`
-- [Kris Linquist](https://github.com/klinquist) aka `klinquist`
-- [igrcic](https://github.com/igrcic)
-- [Danny Guo](https://github.com/dguo) aka `dguo`
-- [Thalis Kalfigkopoulos](https://github.com/tkalfigo) aka `tkalfigo`
-- [Joseph Dykstra](https://github.com/ArtskydJ) aka `ArtskydJ`
-- [Philip Hayes](https://github.com/phlip9) aka `phlip9`
-- [albin3](https://github.com/albin3)
-- [Andrew Newdigate](https://github.com/suprememoocow) aka `suprememoocow`
+# Contributors
+<table><tr><td width="20%"><a href="https://github.com/luin"><img src="https://avatars.githubusercontent.com/u/635902?v=3" /></a><p align="center">luin</p></td><td width="20%"><a href="https://github.com/dguo"><img src="https://avatars.githubusercontent.com/u/2763135?v=3" /></a><p align="center">dguo</p></td><td width="20%"><a href="https://github.com/nakulgan"><img src="https://avatars.githubusercontent.com/u/189836?v=3" /></a><p align="center">nakulgan</p></td><td width="20%"><a href="https://github.com/hayeah"><img src="https://avatars.githubusercontent.com/u/50120?v=3" /></a><p align="center">hayeah</p></td><td width="20%"><a href="https://github.com/albin3"><img src="https://avatars.githubusercontent.com/u/6190670?v=3" /></a><p align="center">albin3</p></td></tr><tr><td width="20%"><a href="https://github.com/phlip9"><img src="https://avatars.githubusercontent.com/u/918989?v=3" /></a><p align="center">phlip9</p></td><td width="20%"><a href="https://github.com/fracmak"><img src="https://avatars.githubusercontent.com/u/378178?v=3" /></a><p align="center">fracmak</p></td><td width="20%"><a href="https://github.com/suprememoocow"><img src="https://avatars.githubusercontent.com/u/594566?v=3" /></a><p align="center">suprememoocow</p></td><td width="20%"><a href="https://github.com/lpinca"><img src="https://avatars.githubusercontent.com/u/1443911?v=3" /></a><p align="center">lpinca</p></td><td width="20%"><a href="https://github.com/devaos"><img src="https://avatars.githubusercontent.com/u/5412167?v=3" /></a><p align="center">devaos</p></td></tr><tr><td width="20%"><a href="https://github.com/jeffjen"><img src="https://avatars.githubusercontent.com/u/5814507?v=3" /></a><p align="center">jeffjen</p></td><td width="20%"><a href="https://github.com/horx"><img src="https://avatars.githubusercontent.com/u/1332618?v=3" /></a><p align="center">horx</p></td><td width="20%"><a href="https://github.com/klinquist"><img src="https://avatars.githubusercontent.com/u/1343376?v=3" /></a><p align="center">klinquist</p></td><td width="20%"><a href="https://github.com/ColmHally"><img src="https://avatars.githubusercontent.com/u/20333?v=3" /></a><p align="center">ColmHally</p></td><td width="20%"><a href="https://github.com/alsotang"><img src="https://avatars.githubusercontent.com/u/1147375?v=3" /></a><p align="center">alsotang</p></td></tr><tr><td width="20%"><a href="https://github.com/pensierinmusica"><img src="https://avatars.githubusercontent.com/u/3594037?v=3" /></a><p align="center">pensierinmusica</p></td><td width="20%"><a href="https://github.com/i5ting"><img src="https://avatars.githubusercontent.com/u/3118295?v=3" /></a><p align="center">i5ting</p></td><td width="20%"><a href="https://github.com/igrcic"><img src="https://avatars.githubusercontent.com/u/394398?v=3" /></a><p align="center">igrcic</p></td><td width="20%"><a href="https://github.com/nswbmw"><img src="https://avatars.githubusercontent.com/u/4279697?v=3" /></a><p align="center">nswbmw</p></td><td width="20%"><a href="https://github.com/VikramTiwari"><img src="https://avatars.githubusercontent.com/u/1330677?v=3" /></a><p align="center">VikramTiwari</p></td></tr><tr><td width="20%"><a href="https://github.com/pyros2097"><img src="https://avatars.githubusercontent.com/u/1687946?v=3" /></a><p align="center">pyros2097</p></td><td width="20%"><a href="https://github.com/henstock"><img src="https://avatars.githubusercontent.com/u/13809467?v=3" /></a><p align="center">henstock</p></td><td width="20%"><a href="https://github.com/devoto13"><img src="https://avatars.githubusercontent.com/u/823594?v=3" /></a><p align="center">devoto13</p></td><td width="20%"><a href="https://github.com/ArtskydJ"><img src="https://avatars.githubusercontent.com/u/1833684?v=3" /></a><p align="center">ArtskydJ</p></td><td width="20%"><a href="https://github.com/tkalfigo"><img src="https://avatars.githubusercontent.com/u/3481553?v=3" /></a><p align="center">tkalfigo</p></td></tr><tr><td width="20%"><a href="https://github.com/mtlima"><img src="https://avatars.githubusercontent.com/u/9111440?v=3" /></a><p align="center">mtlima</p></td><td width="20%"><a href="https://github.com/joeledwards"><img src="https://avatars.githubusercontent.com/u/412853?v=3" /></a><p align="center">joeledwards</p></td><td width="20%"><a href="https://github.com/AVVS"><img src="https://avatars.githubusercontent.com/u/1713617?v=3" /></a><p align="center">AVVS</p></td></table>
 
 # Roadmap
 
